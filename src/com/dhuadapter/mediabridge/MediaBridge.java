@@ -81,6 +81,7 @@ public final class MediaBridge {
     private static final int TX_REQUEST_PLAY            = 6;
     private static final int TX_UPDATE_PLAYBACK_STATE   = 7;
     private static final int TX_UPDATE_CURRENT_SOURCE_TYPE = 9;   // updateCurrentSourceType(token,int) — needs focus
+    private static final int TX_UPDATE_CURRENT_PROGRESS    = 11;  // updateCurrentProgress(token,long) — server fans out to cluster/dim/widget
     private static final int TX_GET_STATE_BINDER        = 0x21; // 33
     private static final int TX_GET_MEDIA_CONTROLLER_API= 0x23; // 35
 
@@ -182,6 +183,8 @@ public final class MediaBridge {
     private volatile IBinder token;              // IMediaCenterClientToken (from ITokenCallBack)
     private volatile boolean registered;
     private volatile boolean lastPlaying;        // edge-track PLAYING for requestPlay re-acquire
+    private volatile boolean progressTicking;    // 1 Hz progress pump active (playing)
+    private static final long PROGRESS_TICK_MS = 1000L;
 
     private volatile MediaController controller;
 
@@ -237,6 +240,8 @@ public final class MediaBridge {
             stateSvc = null;
             token = null;
             registered = false;
+            progressTicking = false;
+            main.removeCallbacks(progressTick);
         }
     };
 
@@ -410,6 +415,10 @@ public final class MediaBridge {
         // → clean log, no early "please requestPlay first").
         main.postDelayed(new Runnable() { @Override public void run() { pushState(); } }, 400);
         main.postDelayed(new Runnable() { @Override public void run() { pushState(); } }, 1500);
+        // Progress fan-out: once focus settles, start pumping position to the server,
+        // which forwards it to cluster, dim AND the launcher widget
+        // (MediaMainApiImpl.updateCurrentProgress -> getCtrlWidgetCallback().updateProgress).
+        main.postDelayed(new Runnable() { @Override public void run() { startProgressTicks(); } }, 1600);
         // Seed the playing-edge tracker so the first onPlaybackStateChanged doesn't
         // re-fire requestPlay (focus already claimed above).
         PlaybackState p0 = ps();
@@ -438,6 +447,73 @@ public final class MediaBridge {
             reply.recycle();
             data.recycle();
         }
+    }
+
+    /**
+     * IMediaCenterSvc.updateCurrentProgress(11): token + progress(long, ms).
+     * The server (MediaMainApiImpl.updateCurrentProgress) fans this out to the
+     * cluster seek bar, the dim display AND the launcher widget
+     * (getCtrlWidgetCallback().updateProgress) — so this one outbound push is
+     * what moves the launcher widget's progress bar. Pure Zeekr Binder protocol;
+     * no app references, position derived live from PlaybackState.
+     */
+    private void updateCurrentProgress(long progressMs) {
+        IBinder center = mediaCenterSvc;
+        IBinder tk = token;
+        if (center == null || tk == null) {
+            return;
+        }
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(DESC_CENTER);
+            data.writeStrongBinder(tk);
+            data.writeLong(progressMs);
+            center.transact(TX_UPDATE_CURRENT_PROGRESS, data, reply, 0);
+            reply.readException();
+        } catch (Throwable t) {
+            Log.w(TAG, "updateCurrentProgress failed", t);
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    /**
+     * Self-reposting 1 Hz progress pump. getPosition() is only a snapshot, so a
+     * steady tick (position() extrapolates between PlaybackState updates) keeps
+     * the widget/cluster bar moving. Ticks only while PLAYING; on pause/stop it
+     * pushes the final frozen position once and halts, and onPlaybackStateChanged
+     * restarts it on the next PLAYING edge.
+     */
+    private final Runnable progressTick = new Runnable() {
+        @Override public void run() {
+            if (!progressTicking) {
+                return;
+            }
+            PlaybackState p = ps();
+            updateCurrentProgress(position(p));
+            if (p != null && p.getState() == PlaybackState.STATE_PLAYING) {
+                main.postDelayed(this, PROGRESS_TICK_MS);
+            } else {
+                progressTicking = false;   // final position already pushed above
+            }
+        }
+    };
+
+    private void startProgressTicks() {
+        if (!registered || progressTicking) {
+            return;
+        }
+        progressTicking = true;
+        main.removeCallbacks(progressTick);
+        main.post(progressTick);
+    }
+
+    private void stopProgressTicks() {
+        progressTicking = false;
+        main.removeCallbacks(progressTick);
+        updateCurrentProgress(position(ps()));   // land the bar at the paused position
     }
 
     /** Claim media focus (requestPlay, code 6) only when we are actually PLAYING. */
@@ -769,7 +845,11 @@ public final class MediaBridge {
 
     private final MediaController.Callback controllerCb = new MediaController.Callback() {
         @Override public void onMetadataChanged(MediaMetadata metadata) { pushState(); }
-        @Override public void onPlaybackStateChanged(PlaybackState state) { pushState(); requestPlayIfPlaying(); }
+        @Override public void onPlaybackStateChanged(PlaybackState state) {
+            pushState(); requestPlayIfPlaying();
+            if (state != null && state.getState() == PlaybackState.STATE_PLAYING) startProgressTicks();
+            else stopProgressTicks();
+        }
         @Override public void onSessionDestroyed() { Log.i(TAG, "app MediaSession destroyed"); }
     };
 
