@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.ServiceConnection;
 import android.graphics.Bitmap;
 import android.media.MediaMetadata;
+import android.media.Rating;
 import android.media.session.MediaController;
 import android.media.session.PlaybackState;
 import android.net.Uri;
@@ -141,6 +142,18 @@ public final class MediaBridge {
     private static final int TX_PI_GET_PLAYING_LIST_ID = 30;  // 0x1e -> "info id" in server log
     private static final int TX_PI_GET_PLAYING_LIST_TYPE = 32; // 0x20 -> list type (int)
     private static final int TX_PI_GET_PLAYER_INTENT  = 0x21;  // 33 -> PendingIntent (wake, player UI)
+    // ── capability / collect / lyric getters (server reads these to drive the UI) ──
+    private static final int TX_PI_GET_LYRIC_CONTENT      = 12;   // 0xc  -> String
+    private static final int TX_PI_GET_LYRIC              = 13;   // 0xd  -> Uri (nullable)
+    private static final int TX_PI_GET_CUR_LYRIC_SENTENCE = 14;   // 0xe  -> String
+    private static final int TX_PI_IS_SUPPORT_COLLECT     = 20;   // 0x14 -> bool (favourite supported)
+    private static final int TX_PI_IS_COLLECTED           = 21;   // 0x15 -> bool (currently favourited)
+    private static final int TX_PI_IS_SUPPORT_DOWNLOAD    = 22;   // 0x16 -> bool
+    private static final int TX_PI_IS_SUPPORT_LOOP        = 28;   // 0x1c -> bool (repeat/shuffle switch)
+    private static final int TX_PI_GET_COLLECT_TYPE       = 36;   // 0x24 -> int (TYPE_COLLECTION_*)
+    private static final int TX_PI_GET_TRANSLATED_LYRICS  = 54;   // 0x36 -> String
+    private static final int TX_PI_IS_SUPPORT_DRAG        = 48;   // 0x30 -> bool (seek-bar draggable)
+    private static final int ZK_COLLECTION_MUSIC          = 0;    // TYPE_COLLECTION_MUSIC
 
     // PlaybackStatus ints per firmware: IDLE=0, PLAYING=1, PAUSED=2.
     private static final int ZK_STATUS_IDLE = 0;
@@ -995,6 +1008,30 @@ public final class MediaBridge {
         return ZK_STATUS_PAUSED;
     }
 
+    // ── Capability getters, derived live from framework API (no hardcode) ──────
+    // The media server reads these off our IMusicPlaybackInfo stub when it builds
+    // its MediaPlayInfo snapshot, and the UI greys out controls accordingly.
+    private long actions(PlaybackState p) { return p != null ? p.getActions() : 0L; }
+    /** Seek-bar draggable iff the session advertises ACTION_SEEK_TO. */
+    private boolean supportsDrag(PlaybackState p) { return (actions(p) & PlaybackState.ACTION_SEEK_TO) != 0L; }
+    /** Repeat/shuffle switch iff the session advertises a repeat- or shuffle-mode action. */
+    private boolean supportsLoopSwitch(PlaybackState p) {
+        return (actions(p) & (PlaybackState.ACTION_SET_REPEAT_MODE | PlaybackState.ACTION_SET_SHUFFLE_MODE)) != 0L;
+    }
+    /** Favourite/collect supported iff the session accepts ACTION_SET_RATING. */
+    private boolean supportsCollect(PlaybackState p) { return (actions(p) & PlaybackState.ACTION_SET_RATING) != 0L; }
+    /** Currently favourited: the track carries a HEART user-rating that is set. */
+    private boolean isCollected(MediaMetadata m) {
+        if (m == null) { return false; }
+        try {
+            Rating r = m.getRating(MediaMetadata.METADATA_KEY_USER_RATING);
+            return r != null && r.isRated() && r.getRatingStyle() == Rating.RATING_HEART && r.hasHeart();
+        } catch (Throwable t) { return false; }
+    }
+    /** Android MediaMetadata has no standard lyric key, so we expose none until a
+     *  source provides one — a safe empty rather than a failed getter. */
+    private String lyricContent(MediaMetadata m) { return ""; }
+
     /** Prefer http(s) ART_URI (media-center fetches it); fall back to CoverProvider content://. */
     private Uri resolveArtwork(MediaMetadata m) {
         if (m == null) {
@@ -1245,6 +1282,16 @@ public final class MediaBridge {
                 case TX_PI_GET_PLAYING_LIST_ID: data.enforceInterface(DESC_PLAYBACK_INFO); replyStr(reply, mediaId(m)); return true;
                 case TX_PI_GET_UUID:            data.enforceInterface(DESC_PLAYBACK_INFO); replyStr(reply, mediaId(m)); return true;
                 case TX_PI_GET_PLAYING_LIST_TYPE: data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, 0); return true;
+                case TX_PI_IS_SUPPORT_DRAG:     data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, supportsDrag(p) ? 1 : 0); return true;
+                case TX_PI_IS_SUPPORT_LOOP:     data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, supportsLoopSwitch(p) ? 1 : 0); return true;
+                case TX_PI_IS_SUPPORT_COLLECT:  data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, supportsCollect(p) ? 1 : 0); return true;
+                case TX_PI_IS_COLLECTED:        data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, isCollected(m) ? 1 : 0); return true;
+                case TX_PI_GET_COLLECT_TYPE:    data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, ZK_COLLECTION_MUSIC); return true;
+                case TX_PI_IS_SUPPORT_DOWNLOAD: data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, 0); return true;
+                case TX_PI_GET_LYRIC_CONTENT:   data.enforceInterface(DESC_PLAYBACK_INFO); replyStr(reply, lyricContent(m)); return true;
+                case TX_PI_GET_CUR_LYRIC_SENTENCE: data.enforceInterface(DESC_PLAYBACK_INFO); replyStr(reply, ""); return true;
+                case TX_PI_GET_TRANSLATED_LYRICS:  data.enforceInterface(DESC_PLAYBACK_INFO); replyStr(reply, ""); return true;
+                case TX_PI_GET_LYRIC:           data.enforceInterface(DESC_PLAYBACK_INFO); replyUri(reply, null); return true;
                 case INTERFACE_TRANSACTION:
                     if (reply != null) { reply.writeString(DESC_PLAYBACK_INFO); }
                     return true;
