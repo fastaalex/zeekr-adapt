@@ -83,6 +83,8 @@ public final class MediaBridge {
     private static final int TX_UPDATE_PLAYBACK_STATE   = 7;
     private static final int TX_UPDATE_CURRENT_SOURCE_TYPE = 9;   // updateCurrentSourceType(token,int) — needs focus
     private static final int TX_UPDATE_CURRENT_PROGRESS    = 11;  // updateCurrentProgress(token,long) — server fans out to cluster/dim/widget
+    private static final int TX_UPDATE_PLAYLIST            = 10;  // updatePlaylist(token,int type,List<IMedia>) — needs focus; feeds center/dim "next up"
+    private static final int ZK_MEDIA_LIST_TYPE_NORMAL     = 0;   // TYPE_MEDIA_LIST_NORMAL
     private static final int TX_GET_STATE_BINDER        = 0x21; // 33
     private static final int TX_GET_MEDIA_CONTROLLER_API= 0x23; // 35
 
@@ -432,6 +434,8 @@ public final class MediaBridge {
         // which forwards it to cluster, dim AND the launcher widget
         // (MediaMainApiImpl.updateCurrentProgress -> getCtrlWidgetCallback().updateProgress).
         main.postDelayed(new Runnable() { @Override public void run() { startProgressTicks(); } }, 1600);
+        // Seed the "next up" list once focus has settled.
+        main.postDelayed(new Runnable() { @Override public void run() { updatePlaylist(); } }, 1700);
         // Seed the playing-edge tracker so the first onPlaybackStateChanged doesn't
         // re-fire requestPlay (focus already claimed above).
         PlaybackState p0 = ps();
@@ -527,6 +531,94 @@ public final class MediaBridge {
         progressTicking = false;
         main.removeCallbacks(progressTick);
         updateCurrentProgress(position(ps()));   // land the bar at the paused position
+    }
+
+    // ── Play queue -> server (updatePlaylist, code 10) ────────────────────────
+    // Pushes the live MediaController queue as a List<IMedia> so the center/dim
+    // "next up" list reflects the real queue. Needs focus. App-agnostic: every
+    // field comes from framework MediaDescription, and IMedia is written with real
+    // Parcel calls in the exact field order the server's IMedia reads back.
+    private void updatePlaylist() {
+        IBinder center = mediaCenterSvc;
+        IBinder tk = token;
+        if (!registered || center == null || tk == null) {
+            return;
+        }
+        MediaController mc = controller;
+        java.util.List<android.media.session.MediaSession.QueueItem> q =
+                (mc != null) ? mc.getQueue() : null;
+        if (q == null || q.isEmpty()) {
+            return;   // server drops empty lists anyway
+        }
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(DESC_CENTER);
+            data.writeStrongBinder(tk);
+            data.writeInt(ZK_MEDIA_LIST_TYPE_NORMAL);
+            // writeTypedList(List<IMedia>): size, then per element writeInt(1)+writeToParcel
+            data.writeInt(q.size());
+            int idx = 0;
+            for (android.media.session.MediaSession.QueueItem qi : q) {
+                data.writeInt(1);
+                writeMediaItem(data, qi, idx++);
+            }
+            center.transact(TX_UPDATE_PLAYLIST, data, reply, 0);
+            reply.readException();
+        } catch (Throwable t) {
+            Log.w(TAG, "updatePlaylist failed", t);
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    /**
+     * Marshal one queue item as com.zeekr.sdk.mediacenter.bean.IMedia, field for
+     * field in its exact writeToParcel order (verified against the vendored SDK).
+     * Uri fields use the real Parcel.writeParcelable so the bytes match the
+     * server's readParcelable(Uri). Unknown fields -> "" / 0 / null.
+     */
+    private void writeMediaItem(Parcel p, android.media.session.MediaSession.QueueItem qi, int indexInQueue) {
+        android.media.MediaDescription d = (qi != null) ? qi.getDescription() : null;
+        String title  = (d != null && d.getTitle()       != null) ? d.getTitle().toString()       : "";
+        String artist = (d != null && d.getSubtitle()     != null) ? d.getSubtitle().toString()     : "";
+        String descr  = (d != null && d.getDescription()  != null) ? d.getDescription().toString()  : "";
+        String mid    = (d != null && d.getMediaId()      != null) ? d.getMediaId()                  : "";
+        Uri    path   = (d != null) ? d.getMediaUri() : null;
+        Uri    art    = (d != null) ? d.getIconUri()  : null;
+        long   dur    = 0L;
+        try { if (d != null && d.getExtras() != null) dur = d.getExtras().getLong(MediaMetadata.METADATA_KEY_DURATION, 0L); } catch (Throwable ignore) {}
+        p.writeString(mid);                 // uuid (stable id == mediaId)
+        p.writeString(title);               // title
+        p.writeString(artist);              // artist
+        p.writeString("");                  // album
+        p.writeString("");                  // author
+        p.writeString("");                  // composer
+        p.writeString(descr);               // description
+        p.writeString(artist);              // subtitle
+        p.writeString("");                  // rating
+        p.writeString("");                  // year
+        p.writeLong(dur);                   // duration
+        p.writeInt(indexInQueue);           // positionInQueue
+        p.writeInt(indexInQueue);           // albumIndex
+        p.writeString("");                  // categoryStr
+        p.writeString("");                  // subCategoryStr
+        p.writeString(mid);                 // mediaId
+        p.writeString("");                  // mediaCp
+        p.writeString("");                  // targetType
+        p.writeInt(ZK_SOURCE_TYPE_ONLINE);  // sourceType
+        p.writeParcelable(path, 0);         // mediaPath (Uri)
+        p.writeString("");                  // lyricContent
+        p.writeParcelable(null, 0);         // lyric (Uri)
+        p.writeParcelable(art, 0);          // artWork (Uri)
+        p.writeString("");                  // radioFrequency
+        p.writeString("");                  // radioStationName
+        p.writeInt(0);                      // vip
+        p.writeString("");                  // playingMediaListId
+        p.writeInt(0);                      // playingMediaListType
+        p.writeInt(0);                      // supportCollect
+        p.writeInt(0);                      // collected
     }
 
     /** Claim media focus (requestPlay, code 6) only when we are actually PLAYING. */
@@ -863,6 +955,7 @@ public final class MediaBridge {
             if (state != null && state.getState() == PlaybackState.STATE_PLAYING) startProgressTicks();
             else stopProgressTicks();
         }
+        @Override public void onQueueChanged(java.util.List<android.media.session.MediaSession.QueueItem> queue) { updatePlaylist(); }
         @Override public void onSessionDestroyed() { Log.i(TAG, "app MediaSession destroyed"); }
     };
 
