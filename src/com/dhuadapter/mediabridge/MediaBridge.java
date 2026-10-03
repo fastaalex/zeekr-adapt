@@ -123,6 +123,7 @@ public final class MediaBridge {
     private static final int TX_MC_ON_PREVIOUS  = 4;
     private static final int TX_MC_ON_FORWARD   = 5;
     private static final int TX_MC_ON_REWIND    = 6;
+    private static final int TX_MC_ON_COLLECT   = 0xf;  // 15 onCollect(int type, boolean isCollect)
     private static final int TX_MC_GET_PLAYBACK_INFO = 0xa;
     private static final int TX_MC_GET_SOURCE_TYPE_LIST    = 11;  // -> int[] (createIntArray)
     private static final int TX_MC_GET_CURRENT_SOURCE_TYPE = 12;  // -> int
@@ -156,6 +157,7 @@ public final class MediaBridge {
     private static final int TX_PI_GET_TRANSLATED_LYRICS  = 54;   // 0x36 -> String
     private static final int TX_PI_IS_SUPPORT_DRAG        = 48;   // 0x30 -> bool (seek-bar draggable)
     private static final int ZK_COLLECTION_MUSIC          = 0;    // TYPE_COLLECTION_MUSIC
+    private static final int TX_PI_GET_PLAY_CTRL_SUPPORT  = 47;   // 0x2f -> int bitmask: bit0=NEXT, bit1=play/pause, bit2=PREVIOUS
 
     // PlaybackStatus ints per firmware: IDLE=0, PLAYING=1, PAUSED=2.
     private static final int ZK_STATUS_IDLE = 0;
@@ -1124,6 +1126,19 @@ public final class MediaBridge {
     /** Android MediaMetadata has no standard lyric key, so we expose none until a
      *  source provides one — a safe empty rather than a failed getter. */
     private String lyricContent(MediaMetadata m) { return ""; }
+    /**
+     * getPlayControllerSupport bitmask. Encoding verified against the UI consumer
+     * com.zeekr.mediawidget.mediacenter.PlaybackInfoCal (ZeekrMediaMultiDisplay /
+     * FloatLyrics): bit0(1)=NEXT, bit1(2)=play/pause, bit2(4)=PREVIOUS. Derived
+     * live from PlaybackState.getActions(); no hardcode. */
+    private int playCtrlSupportMask(PlaybackState p) {
+        long a = actions(p);
+        int s = 0;
+        if ((a & PlaybackState.ACTION_SKIP_TO_NEXT) != 0L) { s |= 1; }
+        if ((a & (PlaybackState.ACTION_PLAY | PlaybackState.ACTION_PAUSE | PlaybackState.ACTION_PLAY_PAUSE)) != 0L) { s |= 2; }
+        if ((a & PlaybackState.ACTION_SKIP_TO_PREVIOUS) != 0L) { s |= 4; }
+        return s;
+    }
 
     /** Prefer http(s) ART_URI (media-center fetches it); fall back to CoverProvider content://. */
     private Uri resolveArtwork(MediaMetadata m) {
@@ -1311,6 +1326,13 @@ public final class MediaBridge {
                 case TX_MC_ON_PREVIOUS: data.enforceInterface(DESC_MUSIC_CLIENT); replyOk(reply, transport(TransportOp.PREV, 0)); return true;
                 case TX_MC_ON_FORWARD:  data.enforceInterface(DESC_MUSIC_CLIENT); replyOk(reply, transport(TransportOp.FORWARD, 0)); return true;
                 case TX_MC_ON_REWIND:   data.enforceInterface(DESC_MUSIC_CLIENT); replyOk(reply, transport(TransportOp.REWIND, 0)); return true;
+                case TX_MC_ON_COLLECT: {
+                    data.enforceInterface(DESC_MUSIC_CLIENT);
+                    int type = data.readInt();            // collect type (0=music) — not needed
+                    boolean isCollect = data.readInt() != 0;
+                    replyOk(reply, collect(isCollect));
+                    return true;
+                }
                 case TX_MC_PROGRESS_DRAG: {
                     data.enforceInterface(DESC_MUSIC_CLIENT);
                     long pos = data.readLong();
@@ -1376,6 +1398,7 @@ public final class MediaBridge {
                 case TX_PI_GET_UUID:            data.enforceInterface(DESC_PLAYBACK_INFO); replyStr(reply, mediaId(m)); return true;
                 case TX_PI_GET_PLAYING_LIST_TYPE: data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, 0); return true;
                 case TX_PI_IS_SUPPORT_DRAG:     data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, supportsDrag(p) ? 1 : 0); return true;
+                case TX_PI_GET_PLAY_CTRL_SUPPORT: data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, playCtrlSupportMask(p)); return true;
                 case TX_PI_IS_SUPPORT_LOOP:     data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, supportsLoopSwitch(p) ? 1 : 0); return true;
                 case TX_PI_IS_SUPPORT_COLLECT:  data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, supportsCollect(p) ? 1 : 0); return true;
                 case TX_PI_IS_COLLECTED:        data.enforceInterface(DESC_PLAYBACK_INFO); replyInt(reply, isCollected(m) ? 1 : 0); return true;
@@ -1557,6 +1580,26 @@ public final class MediaBridge {
         } catch (Throwable ignored) { }
         return null;
     }
+    /**
+     * Center requested a favourite toggle (IZeekrMusicClient.onCollect, code 15).
+     * Reflect it onto the app via the framework rating API. Best-effort: a no-op
+     * (returns false) if the app's MediaSession doesn't accept a HEART rating.
+     * The new state propagates back through isCollected() on the next pushState.
+     */
+    private boolean collect(boolean isCollect) {
+        MediaController mc = controller;
+        if (mc == null) {
+            return false;
+        }
+        try {
+            mc.getTransportControls().setRating(Rating.newHeartRating(isCollect));
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "collect(setRating) failed", t);
+            return false;
+        }
+    }
+
     private boolean transport(TransportOp op, long arg) {
         MediaController mc = controller;
         if (mc == null) {
